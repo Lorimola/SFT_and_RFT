@@ -1,4 +1,4 @@
-# Project Title
+# The Difference Between SFT and RFT
 
 > This experiment focuses on the role of SFT and RFT in improving the performance of the model.
 
@@ -6,7 +6,7 @@
 
 ## Table of Contents
 
-- [Project Title](#project-title)
+- [The Difference Between SFT and RFT](#the-difference-between-SFT-and-RFT)
   - [Table of Contents](#table-of-contents)
   - [Experimental Design](#experimental-design)
   - [Setup and Configuration](#setup-and-configuration)
