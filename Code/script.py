@@ -1,46 +1,87 @@
-import json
-import random
+import json, os
+from typing import Dict, Any, List
 
-def count_images(json_path):
-    """统计 json 文件中图片数量"""
-    with open(json_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+def to_llava_sample_android(sample: Dict[str, Any], dataset_name: str) -> Dict[str, Any]:
+    """
+    Convert one Android Control sample to LLaVA/Qwen format,
+    while preserving all original fields.
+    """
+    image = sample.get("image_path")
+    assert image, "Android sample must include image_path"
 
-    if isinstance(data[0], dict) and "image_path" in data[0]:
-        # android_control 任务级
-        return sum(len(task["image_path"]) for task in data)
-    else:
-        # AITZ 单步级
-        return len(data)
+    instruction = sample.get("instruction", "请根据屏幕完成下一步操作")
 
-def sample_to_match(json_path, target_img_count, output_path):
-    """从 android_control 抽样，使图片数尽量接近 target_img_count，但不截断任务"""
-    with open(json_path, 'r', encoding='utf-8') as f:
-        data = json.load(f)
+    gold = sample.get("target_action") or sample.get("answer") or ""
 
-    random.shuffle(data)  # 打乱任务顺序
+    # conversations
+    conversations = [
+        {"from": "human", "value": f"<image>\n {instruction}"},
+        {"from": "gpt", "value": str(gold).strip()}
+    ]
 
-    selected_tasks = []
-    total_images = 0
+    out_sample = dict(sample)
+    out_sample.update({
+        "id": f"{dataset_name}_{sample.get('id','unk')}_{sample.get('step_id','0')}",
+        "image": image,
+        "conversations": conversations,
+    })
 
-    for task in data:
-        task_imgs = len(task["image_path"])
-        if total_images + task_imgs > target_img_count:
-            # 如果加上这个任务会超过目标，就结束
-            break
-        selected_tasks.append(task)
-        total_images += task_imgs
-
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(selected_tasks, f, ensure_ascii=False, indent=2)
-
-    print(f"[{output_path}] 共采样 {total_images} 张图片，目标 {target_img_count} 张")
+    return out_sample
 
 
+def to_llava_sample_aitz(sample: Dict[str, Any], dataset_name: str) -> Dict[str, Any]:
+    image = sample.get("image_path") or sample.get("image_full_path")
+    assert image, "AITZ sample must include image_path"
 
-sample_to_match("/data2/home/donglingzhong/yangsb/SAR/Dateset/android_control/train.json", 13919,
-                "/data2/home/donglingzhong/yangsb/SAR/Dateset/android_control/train_sampled.json")
+    task = sample.get("task", "请根据屏幕完成下一步操作")
+    gold = sample.get("coat_action_desc") or sample.get("result_action_text") or ""
 
-sample_to_match("/data2/home/donglingzhong/yangsb/SAR/Dateset/android_control/test.json", 4724,
-                "/data2/home/donglingzhong/yangsb/SAR/Dateset/android_control/test_sampled.json")
+    conversations = [
+        {"from": "human", "value": f"<image>\n {task}"},
+        {"from": "gpt", "value": str(gold).strip()}
+    ]
 
+    out_sample = dict(sample)
+    out_sample.update({
+        "id": f"{dataset_name}_{sample.get('episode_id','unk')}_{sample.get('step_id','0')}",
+        "image": image,
+        "conversations": conversations,
+    })
+
+    return out_sample
+
+
+def convert(in_json_path: str, out_json_path: str, dataset_name: str, dataset_type: str):
+    data: List[Dict[str, Any]] = []
+    with open(in_json_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    for s in raw:
+        try:
+            if dataset_type == "AITZ":
+                data.append(to_llava_sample_aitz(s, dataset_name))
+            elif dataset_type == "AndroidCtrl":
+                data.append(to_llava_sample_android(s, dataset_name))
+        except AssertionError:
+            continue
+
+    os.makedirs(os.path.dirname(out_json_path), exist_ok=True)
+    with open(out_json_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    print(f"Saved {len(data)} samples to {out_json_path}")
+
+
+if __name__ == "__main__":
+    convert(
+        in_json_path="/data2/home/donglingzhong/yangsb/Dateset/AITZ/origin_train.json",
+        out_json_path="/data2/home/donglingzhong/yangsb/Dateset/AITZ/train.json",
+        dataset_name="AITZ",
+        dataset_type="AITZ"
+    )
+    convert(
+        in_json_path="/data2/home/donglingzhong/yangsb/Dateset/AndroidCtrl/origin_train.json",
+        out_json_path="/data2/home/donglingzhong/yangsb/Dateset/AndroidCtrl/train.json",
+        dataset_name="AndroidCtrl",
+        dataset_type="AndroidCtrl"
+    )

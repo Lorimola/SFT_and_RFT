@@ -1,161 +1,161 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments, DataCollatorForLanguageModeling
-from datasets import load_dataset
+# save as: train_sft_qwen25vl.py
+import os, json
+from dataclasses import dataclass
+from typing import Dict, List, Any
+
 import torch
-import os
-import random
+from datasets import load_dataset
+from transformers import (
+    AutoProcessor,
+    Qwen2_5_VLForConditionalGeneration,
+    TrainingArguments,
+    TrainerCallback,
+)
+from qwen_vl_utils import process_vision_info
+from trl import SFTTrainer, SFTConfig
+from peft import LoraConfig, get_peft_model
 
-def build_prompt_and_response(example):
+# -------- 配置区域 --------
+MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
+IMAGE_MIN_PIXELS = 256*28*28
+IMAGE_MAX_PIXELS = 1280*28*28   # 你也可以用默认动态分辨率
+USE_FLASH_ATTENTION_2 = True
+
+USE_LORA = True
+LORA_R = 16
+LORA_ALPHA = 32
+LORA_DROPOUT = 0.05
+LORA_TARGET_MODULES = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]  # 语言侧
+# 如需调视觉塔/投影，可扩展 target_modules；详见社区 finetune 方案。 
+
+OUTPUT_DIR = "outputs/qwen25vl_sft"
+EPOCHS = 1
+LR = 1e-4
+BATCH_PER_DEVICE = 1
+GRAD_ACCUM = 8
+MAX_SAMPLES = None  # 开发时可设较小数调通
+
+# -------- 数据加载（LLaVA 格式）--------
+def llava_dataset_from_json(json_path: str, image_folder: str):
     """
-    构造prompt和response，适配AITZ和android_control两类数据。
+    返回 dataset，其中样本为：
+      {
+        "conversations": [{"from":"human","value":"<image>..."} , {"from":"gpt","value":"..."}],
+        "image": "xxx.png" 或 ["a.png","b.png"]
+      }
     """
-    img_field = example.get("image_path", None)
-    # image_path 可能是str或list
-    if isinstance(img_field, str):
-        # AITZ类型样本
-        prompt_parts = []
-        prompt_parts.append(f"ImagePath: {img_field}")
-        
-        # task
-        if "task" in example and example["task"]:
-            prompt_parts.append(f"Task: {example['task']}")
-        
-        # 屏幕描述
-        if "coat_screen_desc" in example and example["coat_screen_desc"]:
-            prompt_parts.append(f"ScreenDescription: {example['coat_screen_desc']}")
-        
-        # 动作思考
-        if "coat_action_think" in example and example["coat_action_think"]:
-            prompt_parts.append(f"ActionThink: {example['coat_action_think']}")
-        
-        # 动作描述
-        if "coat_action_desc" in example and example["coat_action_desc"]:
-            prompt_parts.append(f"ActionDesc: {example['coat_action_desc']}")
-        
-        prompt = "\n".join(prompt_parts)
-        
-        # 期望模型输出动作结果
-        response = example.get("coat_action_result", None)
-        if response is None or response == "":
-            # 找不到动作结果时，尝试用其他可能字段或跳过
-            response = example.get("response", None)
-        if response is None or response == "":
-            return None, None
-        
-        return prompt.strip(), str(response).strip()
+    def gen():
+        data = json.load(open(json_path, "r", encoding="utf-8"))
+        for ex in data:
+            yield {
+                "conversations": ex["conversations"],
+                "images": ex["image"] if isinstance(ex["image"], list) else [ex["image"]],
+                "image_folder": image_folder,
+            }
+    return load_dataset("json", data_files={"train": json_path})["train"].map(lambda _:_, batched=False)
 
-    elif isinstance(img_field, list):
-        # android_control类型样本
-        prompt_parts = []
-        prompt_parts.append("ImagePaths:")
-        prompt_parts.extend(img_field)  # 保留全部图片路径
+# -------- collator：把 conversations+images -> 模型输入 --------
+def build_collate_fn(processor):
+    def collate(batch: List[Dict[str, Any]]):
+        messages_list = []
+        image_inputs_all, video_inputs_all = [], []
+        for ex in batch:
+            conv = ex["conversations"]
+            # 转成 chat messages（严格遵循模型卡示例）
+            # human 含 <image> 占位，但真正的像素由 process_vision_info 传入
+            messages = []
+            for turn in conv:
+                role = "user" if turn["from"] == "human" else "assistant"
+                content = []
+                # 解析 human value 里 <image> 个数，与 images 对齐
+                if role == "user":
+                    img_count = turn["value"].count("<image>")
+                    # image 实际路径（file://）
+                    imgs = ex["images"][:img_count]
+                    for p in imgs:
+                        content.append({"type":"image","image": f"file://{os.path.join(ex['image_folder'], p)}"})
+                    # 去掉占位文本，仅保留文字提示
+                    text = turn["value"].replace("<image>","").strip()
+                    if text:
+                        content.append({"type":"text","text": text})
+                else:
+                    content.append({"type":"text","text": turn["value"]})
+                messages.append({"role": role, "content": content})
 
-        # 如果有任务字段
-        if "task" in example and example["task"]:
-            prompt_parts.append(f"Task: {example['task']}")
+            messages_list.append(messages)
 
-        prompt = "\n".join(prompt_parts)
+        # 文本模板
+        texts = [
+            processor.apply_chat_template(m, tokenize=False, add_generation_prompt=False)
+            for m in messages_list
+        ]
+        # 图像/视频张量
+        vision_infos = [process_vision_info(m) for m in messages_list]
+        images = [vi[0] for vi in vision_infos]  # list of list
+        videos = [vi[1] for vi in vision_infos]
 
-        # 响应字段按常规
-        for resp_key in ("response", "output", "gt", "answer", "label", "target"):
-            if resp_key in example and example[resp_key] not in (None, ""):
-                return prompt.strip(), str(example[resp_key]).strip()
+        # processor 负责把文本 + 图像打包成张量；padding 到 batch 最大长度
+        model_inputs = processor(
+            text=texts,
+            images=images,
+            videos=videos,
+            padding=True,
+            return_tensors="pt",
+        )
+        # labels：仅监督 assistant 输出（SFT）
+        # 这里我们简化：让所有 token 参与 LM 训练（通常也可用 completion-only 策略）
+        model_inputs["labels"] = model_inputs["input_ids"].clone()
+        return model_inputs
+    return collate
 
-        # 找不到有效响应，跳过
-        return None, None
+def main(train_json: str, image_folder: str):
+    # 模型 & 处理器
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else "auto",
+        attn_implementation="flash_attention_2" if USE_FLASH_ATTENTION_2 else "eager",
+        device_map="auto",
+    )
+    processor = AutoProcessor.from_pretrained(
+        MODEL_ID,
+        min_pixels=IMAGE_MIN_PIXELS,
+        max_pixels=IMAGE_MAX_PIXELS,
+    )
 
-    else:
-        # 不符合预期的结构，跳过
-        return None, None
+    if USE_LORA:
+        peft_cfg = LoraConfig(
+            r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT,
+            bias="none", task_type="CAUSAL_LM", target_modules=LORA_TARGET_MODULES
+        )
+        model = get_peft_model(model, peft_cfg)
 
+    dataset = llava_dataset_from_json(train_json, image_folder)
+    if MAX_SAMPLES:
+        dataset = dataset.select(range(min(MAX_SAMPLES, len(dataset))))
 
-def preprocess_function(example, tokenizer, max_length=2048):
-    """
-    map 用的逐样本 preprocess：构建 prompt+response 并 token 化。
-    返回 token ids 与 labels（labels 与 input_ids 相同，用于 SFT）。
-    """
-    prompt, response = build_prompt_and_response(example)
-    if prompt is None or response is None:
-        # 标记为 None，让 map 跳过（datasets.map 里处理）
-        return None
-
-    # 你可以把提示模板自由调整 — 下面是一个标准对话式 SFT 模板
-    full_input = f"<|user|>\n{prompt}\n<|assistant|>\n{response}"
-    # 编码
-    tokenized = tokenizer(full_input, truncation=True, max_length=max_length, padding="max_length")
-    tokenized["labels"] = tokenized["input_ids"].copy()
-    return tokenized
-
-def train_sft(model_name="/data1/models/Qwen2.5-VL-7B-Instruct",
-              train_json="/path/to/your/train.json",
-              output_dir="/data2/home/donglingzhong/yangsb/SAR/models/SFT",
-              per_device_train_batch_size=2,
-              gradient_accumulation_steps=8,
-              num_train_epochs=3,
-              max_length=2048,
-              seed=42):
-    """
-    主训练函数
-    - train_json: 你会传入完整路径（不要改这里的变量名）
-    - 会逐元素地构造 prompt/response（保留 android_control 的 image_path 列表完整性）
-    """
-
-    # 设置随机种子以便重复性
-    random.seed(seed)
-    torch.manual_seed(seed)
-
-    # 加载 tokenizer 与 model（保持你给的默认路径）
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto", trust_remote_code=True)
-
-    # 加载 json（注意：将传入的完整路径作为 train 数据）
-    assert os.path.exists(train_json), f"train_json 路径不存在: {train_json}"
-    dataset = load_dataset("json", data_files={"train": train_json}, field=None)
-
-    # 逐元素 map（非批处理），并跳过返回 None 的样本
-    def _map_fn(example):
-        res = preprocess_function(example, tokenizer, max_length=max_length)
-        return res if res is not None else {}
-
-    tokenized = dataset["train"].map(_map_fn, remove_columns=dataset["train"].column_names, batched=False)
-
-    # datasets.map 返回空 dict 的样本可能存在，需要过滤掉（labels 为 [] 或 input_ids 缺失的）
-    def filter_valid_examples(example):
-        # 有效的样本必须含有 input_ids 且长度>0
-        return "input_ids" in example and example["input_ids"] and "labels" in example and example["labels"]
-
-    tokenized = tokenized.filter(filter_valid_examples)
-
-    # TrainingArguments（保留你原来的训练超参，可以按需调整）
-    training_args = TrainingArguments(
-        per_device_train_batch_size=per_device_train_batch_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        fp16=True,
-        num_train_epochs=num_train_epochs,
+    sft_args = SFTConfig(
+        output_dir=OUTPUT_DIR,
+        num_train_epochs=EPOCHS,
+        learning_rate=LR,
+        per_device_train_batch_size=BATCH_PER_DEVICE,
+        gradient_accumulation_steps=GRAD_ACCUM,
         logging_steps=10,
         save_strategy="epoch",
-        output_dir=output_dir,
-        save_total_limit=2,
-        evaluation_strategy="no",
-        report_to="none"
+        bf16=True,
+        remove_unused_columns=False,   # 多模态必须关
     )
 
-    data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
-
-    trainer = Trainer(
+    trainer = SFTTrainer(
         model=model,
-        args=training_args,
-        train_dataset=tokenized,
-        tokenizer=tokenizer,
-        data_collator=data_collator
+        args=sft_args,
+        train_dataset=dataset,
+        processing_class=processor,   # TRL SFTTrainer 会在必要时处理 tokenizer/特殊符号
+        data_collator=build_collate_fn(processor),
     )
-
     trainer.train()
-    trainer.save_model(output_dir)
-    print("训练完成，模型已保存到：", output_dir)
-
+    trainer.save_model(OUTPUT_DIR)
+    processor.save_pretrained(OUTPUT_DIR)
 
 if __name__ == "__main__":
-    # 请在调用时把 train_json 改成你真实传入的完整路径，例如：
-    # train_sft(train_json="/data2/you/path/android_control/train.json")
-    train_sft()
-
+    # 示例：使用 AITZ 转换后的数据
+    main("data/llava/aitz_train.json", "path/to/aitz_images")
