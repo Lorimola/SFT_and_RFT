@@ -1,14 +1,3 @@
-"""
-DPO 对 Qwen2.5-VL-7B-Instruct 的偏好微调 (RFT)
-- 依赖: transformers>=4.51.3, trl>=0.12.*, peft, datasets, accelerate, pillow
-- 数据要求: 每条样本包含
-    images: List[PIL.Image.Image] 或 图像路径(本脚本会自动打开)
-    prompt: 已对话模板化前的 user 内容(包含一个或多张 <image>)
-    chosen: 助手更优回答
-    rejected: 助手较差回答
-- 若是图像路径，请把字段命名为 image_paths: List[str] 或 image_path: str
-"""
-
 import io
 import os
 import argparse
@@ -34,21 +23,13 @@ except Exception:
 
 
 def ensure_images_in_memory(example: Dict[str, Any], image_root: str = "") -> Dict[str, Any]:
-    """
-    将 image_path(s) 转为 PIL，并标准化为 `images: List[PIL.Image]`。
-    兼容:
-      - images: 已是 PIL 列表
-      - image_path: 单路径
-      - image_paths: 路径列表
-    """
     if "images" in example and isinstance(example["images"], list):
-        # 可能是已经 decode 的 PIL，也可能是 {bytes/...}
         imgs = []
         for im in example["images"]:
             if isinstance(im, Image.Image):
                 imgs.append(im)
             elif isinstance(im, dict) and "bytes" in im:
-                imgs.append(Image.open(io.BytesIO(im["bytes"])))  # 兜底
+                imgs.append(Image.open(io.BytesIO(im["bytes"])))
         example["images"] = imgs
         return example
 
@@ -68,10 +49,6 @@ def ensure_images_in_memory(example: Dict[str, Any], image_root: str = "") -> Di
 
 
 def format_for_chat(example: Dict[str, Any], processor: AutoProcessor, max_resize: int = None) -> Dict[str, Any]:
-    """
-    将 (images, prompt, chosen, rejected) 按 VLM 聊天模板转换为文本串，让 TRL 的 DPOTrainer 能用。
-    """
-    # 可选：限制长边，避免显存暴涨
     if max_resize is None:
         try:
             max_resize = processor.image_processor.size.get("longest_edge", None)
@@ -83,7 +60,6 @@ def format_for_chat(example: Dict[str, Any], processor: AutoProcessor, max_resiz
         for im in imgs:
             im.thumbnail((max_resize, max_resize))
 
-    # user prompt（含占位 <image>），assistant 两个候选
     prompt_msgs = [{"role": "user", "content": [{"type": "image"}] + ([{"type": "text", "text": example["prompt"]}] if example.get("prompt") else [])}]
     chosen_msgs = [{"role": "assistant", "content": [{"type": "text", "text": example["chosen"]}]}]
     rejected_msgs = [{"role": "assistant", "content": [{"type": "text", "text": example["rejected"]}]}]
@@ -91,7 +67,6 @@ def format_for_chat(example: Dict[str, Any], processor: AutoProcessor, max_resiz
     example["prompt"] = processor.apply_chat_template(prompt_msgs, tokenize=False)
     example["chosen"] = processor.apply_chat_template(chosen_msgs, tokenize=False)
     example["rejected"] = processor.apply_chat_template(rejected_msgs, tokenize=False)
-    # TRL 期望列：images, prompt, chosen, rejected
     return example
 
 
@@ -125,10 +100,8 @@ def main():
 
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Processor（既做 tokenizer 也做 image_processor）
     processor = AutoProcessor.from_pretrained(args.model_name_or_path)
 
-    # 模型 & (可选)QLoRA
     bnb_config = None
     dtype = torch.bfloat16 if args.bf16 else torch.float16
 
@@ -150,7 +123,6 @@ def main():
             trust_remote_code=True,
         )
 
-    # LoRA 仅训练 adapter
     peft_config = LoraConfig(
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
@@ -160,7 +132,6 @@ def main():
         task_type="CAUSAL_LM",
     )
 
-    # 读取数据
     if args.dataset_name:
         dataset = load_dataset(args.dataset_name, split=args.dataset_split)
     else:
@@ -175,21 +146,17 @@ def main():
         else:
             raise ValueError(f"不支持的文件类型: {ext}")
 
-    # 将路径转 PIL，标准化列
     dataset = dataset.map(lambda ex: ensure_images_in_memory(ex, args.image_root))
 
-    # 按聊天模板串化
     dataset = dataset.map(lambda ex: format_for_chat(ex, processor), remove_columns=[
         c for c in dataset.column_names if c not in {"images", "prompt", "chosen", "rejected"}
     ])
 
-    # 强制把 images 列 decode 为图像，避免 bytes
     feats = dataset.features
     if not isinstance(feats.get("images"), Sequence):
         feats["images"] = Sequence(HFImage(decode=True))
         dataset = dataset.cast(feats)
 
-    # 训练参数
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
@@ -209,22 +176,19 @@ def main():
         report_to="none",
     )
 
-    # DPO Trainer（VLM）
     trainer = DPOTrainer(
         model=model,
-        ref_model=None,              # 使用 PEFT 时，ref_model 可为 None（内部会复制冻结）
+        ref_model=None,              
         args=training_args,
         beta=args.beta,
         train_dataset=dataset,
-        tokenizer=processor,         # 关键：传入 AutoProcessor (tokenizer + image_processor)
+        tokenizer=processor,         
         peft_config=peft_config,
     )
 
     trainer.train()
-    # 只保存 LoRA 适配器（默认行为）
     trainer.save_model()
 
-    # 同步保存 processor（方便推理）
     processor.save_pretrained(args.output_dir)
 
     print("训练完成。LoRA 适配器已保存到:", args.output_dir)
