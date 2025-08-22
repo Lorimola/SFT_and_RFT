@@ -1,146 +1,113 @@
-import os, json
-from dataclasses import dataclass
-from typing import Dict, List, Any
+import argparse
+from typing import List, Dict, Any
 
 import torch
-from datasets import load_dataset
+from datasets import load_from_disk
+
 from transformers import (
     AutoProcessor,
     Qwen2_5_VLForConditionalGeneration,
-    TrainingArguments,
-    TrainerCallback,
 )
-from qwen_vl_utils import process_vision_info
 from trl import SFTTrainer, SFTConfig
 from peft import LoraConfig, get_peft_model
-
-MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
-IMAGE_MIN_PIXELS = 256*28*28
-IMAGE_MAX_PIXELS = 1280*28*28
-USE_FLASH_ATTENTION_2 = True
-
-USE_LORA = True
-LORA_R = 16
-LORA_ALPHA = 32
-LORA_DROPOUT = 0.05
-LORA_TARGET_MODULES = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
-
-OUTPUT_DIR = "outputs/qwen25vl_sft"
-EPOCHS = 1
-LR = 1e-4
-BATCH_PER_DEVICE = 1
-GRAD_ACCUM = 8
-MAX_SAMPLES = None
-
-
-def llava_dataset_from_json(json_path: str, image_folder: str):
-    """
-    返回 dataset，其中样本为：
-      {
-        "conversations": [{"from":"human","value":"<image>..."} , {"from":"gpt","value":"..."}],
-        "image": "xxx.png" 或 ["a.png","b.png"]
-      }
-    """
-    def gen():
-        data = json.load(open(json_path, "r", encoding="utf-8"))
-        for ex in data:
-            yield {
-                "conversations": ex["conversations"],
-                "images": ex["image"] if isinstance(ex["image"], list) else [ex["image"]],
-                "image_folder": image_folder,
-            }
-    return load_dataset("json", data_files={"train": json_path})["train"].map(lambda _:_, batched=False)
+from qwen_vl_utils import process_vision_info
 
 
 def build_collate_fn(processor):
     def collate(batch: List[Dict[str, Any]]):
-        messages_list = []
-        image_inputs_all, video_inputs_all = [], []
-        for ex in batch:
-            conv = ex["conversations"]
-            messages = []
-            for turn in conv:
-                role = "user" if turn["from"] == "human" else "assistant"
-                content = []
-                if role == "user":
-                    img_count = turn["value"].count("<image>")
-                    imgs = ex["images"][:img_count]
-                    for p in imgs:
-                        content.append({"type":"image","image": f"file://{os.path.join(ex['image_folder'], p)}"})
-                    text = turn["value"].replace("<image>","").strip()
-                    if text:
-                        content.append({"type":"text","text": text})
-                else:
-                    content.append({"type":"text","text": turn["value"]})
-                messages.append({"role": role, "content": content})
-
-            messages_list.append(messages)
-
         texts = [
-            processor.apply_chat_template(m, tokenize=False, add_generation_prompt=False)
-            for m in messages_list
+            processor.apply_chat_template(ex["messages"], tokenize=False, add_generation_prompt=False)
+            for ex in batch
         ]
-        vision_infos = [process_vision_info(m) for m in messages_list]
-        images = [vi[0] for vi in vision_infos]
-        videos = [vi[1] for vi in vision_infos]
+
+        images = []
+        for ex in batch:
+            imgs = []
+            for msg in ex["messages"]:
+                if msg["role"] == "user":
+                    for c in msg["content"]:
+                        if c["type"] == "image":
+                            imgs.append(c["image"].replace("file://", ""))
+            images.append(imgs)
 
         model_inputs = processor(
             text=texts,
             images=images,
-            videos=videos,
             padding=True,
             return_tensors="pt",
         )
+
         model_inputs["labels"] = model_inputs["input_ids"].clone()
         return model_inputs
     return collate
 
-def main(train_json: str, image_folder: str):
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else "auto",
-        attn_implementation="flash_attention_2" if USE_FLASH_ATTENTION_2 else "eager",
-        device_map="auto",
-    )
-    processor = AutoProcessor.from_pretrained(
-        MODEL_ID,
-        min_pixels=IMAGE_MIN_PIXELS,
-        max_pixels=IMAGE_MAX_PIXELS,
-    )
 
-    if USE_LORA:
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen2.5-VL-7B-Instruct")
+    ap.add_argument("--dataset_path", type=str, required=True, help="Path from script.py (save_to_disk)")
+    ap.add_argument("--output_dir", type=str, default="./outputs-sft")
+    ap.add_argument("--num_train_epochs", type=int, default=1)
+    ap.add_argument("--learning_rate", type=float, default=2e-5)
+    ap.add_argument("--per_device_train_batch_size", type=int, default=1)
+    ap.add_argument("--gradient_accumulation_steps", type=int, default=16)
+    ap.add_argument("--bf16", action="store_true")
+    ap.add_argument("--use_lora", action="store_true")
+    ap.add_argument("--lora_r", type=int, default=64)
+    ap.add_argument("--lora_alpha", type=int, default=128)
+    ap.add_argument("--lora_dropout", type=float, default=0.05)
+    ap.add_argument("--max_steps", type=int, default=-1)
+    args = ap.parse_args()
+
+    dtype = torch.bfloat16 if args.bf16 else torch.float16
+
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        args.model_name_or_path,
+        torch_dtype=dtype,
+        attn_implementation="flash_attention_2",
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    if args.use_lora:
         peft_cfg = LoraConfig(
-            r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT,
-            bias="none", task_type="CAUSAL_LM", target_modules=LORA_TARGET_MODULES
+            r=args.lora_r, 
+            lora_alpha=args.lora_alpha, 
+            lora_dropout=args.lora_dropout,
+            bias="none", 
+            task_type="CAUSAL_LM"
         )
         model = get_peft_model(model, peft_cfg)
 
-    dataset = llava_dataset_from_json(train_json, image_folder)
-    if MAX_SAMPLES:
-        dataset = dataset.select(range(min(MAX_SAMPLES, len(dataset))))
+    processor = AutoProcessor.from_pretrained(args.model_name_or_path)
+    # load a dataset which is saved by save_to_disk
+    ds = load_from_disk(args.dataset_path)
 
     sft_args = SFTConfig(
-        output_dir=OUTPUT_DIR,
-        num_train_epochs=EPOCHS,
-        learning_rate=LR,
-        per_device_train_batch_size=BATCH_PER_DEVICE,
-        gradient_accumulation_steps=GRAD_ACCUM,
+        output_dir=args.output_dir,
+        num_train_epochs=args.num_train_epochs,
+        learning_rate=args.learning_rate,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         logging_steps=10,
-        save_strategy="epoch",
-        bf16=True,
+        save_steps=200,
+        bf16=args.bf16,
         remove_unused_columns=False,
+        max_steps=args.max_steps,
+        report_to="none",
     )
 
     trainer = SFTTrainer(
         model=model,
         args=sft_args,
-        train_dataset=dataset,
+        train_dataset=ds,
         processing_class=processor,
         data_collator=build_collate_fn(processor),
     )
     trainer.train()
-    trainer.save_model(OUTPUT_DIR)
-    processor.save_pretrained(OUTPUT_DIR)
+    trainer.save_model(args.output_dir)
+    processor.save_pretrained(args.output_dir)
+    print("SFT complete. Saved to", args.output_dir)
+
 
 if __name__ == "__main__":
-    main("data/llava/aitz_train.json", "path/to/aitz_images")
+    main()

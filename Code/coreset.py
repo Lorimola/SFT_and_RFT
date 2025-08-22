@@ -12,29 +12,36 @@ MODEL_PATH = "/data2/home/donglingzhong/yangsb/Models/clip-vit-base-patch32"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 clip_model = CLIPModel.from_pretrained(MODEL_PATH).to(device)
+# the middle channel between data input and model
+# perform some processing on the data
 processor = CLIPProcessor.from_pretrained(MODEL_PATH)
 
 
 def encode_element(image_paths, batch_size=32):
+    # if "image_paths" is a string, turn it into a list
     if isinstance(image_paths, str):
         image_paths = [image_paths]
 
     embeddings = []
     for i in range(0, len(image_paths), batch_size):
+        # take <batch_size> images at a time
         batch = image_paths[i:i+batch_size]
         images = []
         for p in batch:
             try:
+                # turn an image into <RGB> mode
                 img = Image.open(p).convert("RGB")
                 images.append(img)
             except Exception as e:
                 print(f"No picture {p} with error {e}.")
         if not images:
             continue
-        # put images into model to take embedding
+        # put images into processor, <return_tensor = 'pt'> means return torch.tensor type
         inputs = processor(images=images, return_tensors="pt", padding=True).to(device)
         with torch.no_grad():
+            # get a FloatTensor which represents the embedding
             emb = clip_model.get_image_features(**inputs)
+        # turn the embedding into numpy type
         embeddings.append(emb.cpu().numpy())
     if len(embeddings) == 0:
         return None
@@ -54,7 +61,7 @@ def load_json(path):
         return json.load(f)
 
 
-# imagr_path in android control is a list, but in AITZ is a string
+# image_path in android control is a list, but in AITZ is a string
 def count_images(data, is_control=False):
     if is_control:
         return sum(len(item["image_path"]) for item in data)
@@ -64,12 +71,13 @@ def count_images(data, is_control=False):
 
 def select_subset(control_data, target_img_count):
     """
-    Select subset from android control such that the number of images in subset 
+    Select a subset from android control such that the number of images in subset 
     is equal to AITZ.
     """
     # calculate the embedding of an element in android control
     element_embeddings = []
     valid_indices = []
+    # get the embedding of each element
     for si, sample in enumerate(tqdm(control_data, desc="Encoding elements")):
         emb = encode_element(sample["image_path"])
         if emb is not None:
@@ -83,8 +91,10 @@ def select_subset(control_data, target_img_count):
 
     # calculate KL Divergence to match distribution
     k = min(50, len(element_embeddings) // 2 if len(element_embeddings) > 1 else 1)
+    # clustering
     km = KMeans(n_clusters=k, random_state=0).fit(element_embeddings)
     labels = km.labels_
+    # get the distribution of data
     full_hist = np.bincount(labels, minlength=k).astype(float)
 
     selected_samples = set()
