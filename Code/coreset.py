@@ -141,9 +141,9 @@ def main(aitz_train, aitz_test, control_train, control_test):
     subset_train = select_subset(control_train_data, target_train_imgs)
     subset_test = select_subset(control_test_data, target_test_imgs)
 
-    with open("/data2/home/donglingzhong/yangsb/Dateset/android_control/train_subset.json", "w", encoding="utf-8") as f:
+    with open("/data2/home/donglingzhong/yangsb/Dateset/Subset/train.json", "w", encoding="utf-8") as f:
         json.dump(subset_train, f, indent=2, ensure_ascii=False)
-    with open("/data2/home/donglingzhong/yangsb/Dateset/android_control/test_subset.json", "w", encoding="utf-8") as f:
+    with open("/data2/home/donglingzhong/yangsb/Dateset/Subset/test.json", "w", encoding="utf-8") as f:
         json.dump(subset_test, f, indent=2, ensure_ascii=False)
 
     print("Finish!")
@@ -151,9 +151,9 @@ def main(aitz_train, aitz_test, control_train, control_test):
 
 if __name__ == "__main__":
     main(
-        "/data2/home/donglingzhong/yangsb/Dateset/AITZ/train.json",
-        "/data2/home/donglingzhong/yangsb/Dateset/AITZ/test.json",
-        "/data2/home/donglingzhong/yangsb/Dateset/android_control/train.json",
-        "/data2/home/donglingzhong/yangsb/Dateset/android_control/test.json"
+        "/data2/home/donglingzhong/yangsb/Dateset/Original/AITZ/train.json",
+        "/data2/home/donglingzhong/yangsb/Dateset/Original/AITZ/test.json",
+        "/data2/home/donglingzhong/yangsb/Dateset/Original/android_control/train.json",
+        "/data2/home/donglingzhong/yangsb/Dateset/Original/android_control/test.json"
     )
 

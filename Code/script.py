@@ -6,6 +6,25 @@ from typing import Dict, Any, List, Optional
 from datasets import Dataset
 
 
+"""
+    The output of this script will be a json file and each element is in the form:
+    {
+        id: episode_id + step_id
+        messages: [{
+                       role: <user>
+                       content: <content> which includes images, taske and ui information
+                   },
+                   {
+                       role: <assistant>
+                       content: <content> which includes answer and thinking
+                   }
+                  ]
+        prompt_text
+        chosen_text
+        rejected_text
+    }
+"""
+
 # Turn any type into a string
 def _as_text(v: Any) -> str:
     if v is None:
@@ -82,7 +101,7 @@ def convert_aitz_record(ex: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-# Convert control episode
+# turn android control
 def convert_control_episode(ep: Dict[str, Any]) -> List[Dict[str, Any]]:
     image_paths: List[str] = ep.get("image_path") or []
     actions: List[str] = ep.get("actions") or []
@@ -93,20 +112,28 @@ def convert_control_episode(ep: Dict[str, Any]) -> List[Dict[str, Any]]:
     goal: str = (ep.get("goal") or "").strip()
     accessibilities: List[str] = ep.get("accessibility_tree") or []
 
-    # User content with images
+    # user content
     user_content = []
+
     for i, img in enumerate(image_paths):
         img_info = {
             "type": "image",
-            "image": f"file://{img}",
-            "resized_height": heights[i] if i < len(heights) else None,
-            "resized_width": widths[i] if i < len(widths) else None,
-            "accessibility": accessibilities[i] if i < len(accessibilities) else None,
+            "image": f"file://{img}"
         }
+        if i < len(widths):
+            img_info["resized_width"] = widths[i]
+        if i < len(heights):
+            img_info["resized_height"] = heights[i]
+        if i < len(accessibilities):
+            img_info["accessibility"] = accessibilities[i]
         user_content.append(img_info)
 
-    # Add text-based information
     text_parts = []
+    
+    action_type = ["click", "long_press", "scroll", "open_app", "input_text", "navigate_home", 
+                   "navigate_back", "wait"]
+    text_parts.append(f"You are a GUI Agent, your task is to generate a sequence of actions to complete the given goal. Each action has an action type which is selcted from {action_type}. Output one action per line, in execution order.")
+
     if goal:
         text_parts.append(f"Goal: {goal}")
 
@@ -115,12 +142,16 @@ def convert_control_episode(ep: Dict[str, Any]) -> List[Dict[str, Any]]:
             text_parts.append(f"Task {i}: {task}")
 
     for i, node_info in enumerate(node_infos):
-        text_parts.append(f"Node info {i}: {node_info}")
+        try:
+            node_str = json.dumps(node_info, ensure_ascii=False)
+        except Exception:
+            node_str = str(node_info)
+        text_parts.append(f"Node info {i}: {node_str}")
 
     if text_parts:
         user_content.append({"type": "text", "text": "\n".join(text_parts)})
 
-    # Assistant answer
+    # assistant answer
     ans = "\n".join([str(a).strip() for a in actions if a])
     assistant_content = [{"type": "text", "text": ans}]
 
@@ -129,12 +160,13 @@ def convert_control_episode(ep: Dict[str, Any]) -> List[Dict[str, Any]]:
         {"role": "assistant", "content": assistant_content},
     ]
 
-    # Build DPO fields
+    # Build DPO-style fields
     prompt_text = "\n".join(text_parts).strip()
     chosen_text = ans
     rejected_text = chosen_text[: max(1, len(chosen_text) // 2)] if chosen_text else "I cannot answer."
 
     sid = str(ep.get("episode_id", ep.get("index", "ep")))
+
     return [{
         "id": sid,
         "messages": messages,
@@ -142,6 +174,7 @@ def convert_control_episode(ep: Dict[str, Any]) -> List[Dict[str, Any]]:
         "chosen_text": chosen_text,
         "rejected_text": rejected_text,
     }]
+
 
 
 def main():
