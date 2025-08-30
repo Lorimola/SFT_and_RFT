@@ -16,9 +16,9 @@ echo "script.py finish"
 
 
 echo "Running train_sft.py"
-python3 /data2/home/donglingzhong/yangsb/SAR/Code/train_sft.py --model_name_or_path=/data4/models_wzr/Qwen2.5-VL-7B-Instruct --dataset_path=/data2/home/donglingzhong/yangsb/Dateset/Train/AITZ --output_dir=/data2/home/donglingzhong/yangsb/Models/SFT/AITZ --num_train_epochs=3 --learning_rate=1e-5 --bf16=True --use_lora=False
+python3 /data2/home/donglingzhong/yangsb/SAR/Code/train_sft.py --model_name_or_path=/data4/models_wzr/Qwen2.5-VL-7B-Instruct --dataset_path=/data2/home/donglingzhong/yangsb/Dateset/Train/AITZ --output_dir=/data2/home/donglingzhong/yangsb/Models/SFT/AITZ --num_train_epochs=3 --learning_rate=2e-5 --bf16=True --use_lora=False
 
-python3 /data2/home/donglingzhong/yangsb/SAR/Code/train_sft.py --model_name_or_path=/data4/models_wzr/Qwen2.5-VL-7B-Instruct --dataset_path=/data2/home/donglingzhong/yangsb/Dateset/Train/android_control --output_dir=/data2/home/donglingzhong/yangsb/Models/SFT/android_control --num_train_epochs=3 --learning_rate=1e-5 --bf16=True --use_lora=False
+python3 /data2/home/donglingzhong/yangsb/SAR/Code/train_sft.py --model_name_or_path=/data4/models_wzr/Qwen2.5-VL-7B-Instruct --dataset_path=/data2/home/donglingzhong/yangsb/Dateset/Train/android_control --output_dir=/data2/home/donglingzhong/yangsb/Models/SFT/android_control --num_train_epochs=3 --learning_rate=2e-5 --bf16=True --use_lora=False
 echo "train_sft.py finish"
 
 
